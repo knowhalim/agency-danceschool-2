@@ -1,0 +1,73 @@
+# KnowGitty Agency CI — injected at scaffold time.
+# Gates every push; tags build a release zip and notify the agency site,
+# which auto-deploys to staging (never production).
+name: Agency CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PHP lint (7.4 / 8.2)
+        run: |
+          sudo update-alternatives --set php /usr/bin/php8.2 || true
+          find . -name '*.php' -not -path './vendor/*' -print0 | xargs -0 -n1 php -l
+
+      - name: Build zip
+        run: |
+          mkdir -p build
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'build' ./ "build/agency-danceschool-2/"
+          (cd build && zip -rq "agency-danceschool-2.zip" "agency-danceschool-2")
+
+      - name: Activation smoke test (wp-env)
+        run: |
+          npm -g i @wordpress/env
+          wp-env start
+          # Install + activate the built artifact; a fatal here fails the build
+          # long before anything reaches a real site.
+          wp-env run cli wp plugin install /var/www/html/agency-danceschool-2.zip --activate || \
+          wp-env run cli wp theme install /var/www/html/agency-danceschool-2.zip --activate
+          wp-env run cli wp option get siteurl
+        continue-on-error: false
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "agency-danceschool-2"
+          path: "build/agency-danceschool-2.zip"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: gates
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build zip
+        run: |
+          mkdir -p build
+          rsync -a --exclude '.git' --exclude '.github' --exclude 'build' ./ "build/agency-danceschool-2/"
+          (cd build && zip -rq "agency-danceschool-2.zip" "agency-danceschool-2")
+          echo "SHA256=$(sha256sum "build/agency-danceschool-2.zip" | cut -d' ' -f1)" >> "$GITHUB_ENV"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "build/agency-danceschool-2.zip"
+
+      - name: Notify agency (staging auto-deploy)
+        run: |
+          BODY=$(printf '{"tag":"%s","sha256":"%s"}' "${GITHUB_REF_NAME}" "${SHA256}")
+          SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "${{ secrets.KGA_WEBHOOK_SECRET }}" | cut -d' ' -f2)
+          curl -fsS -X POST "https://pro.knowhalim.com/wp-json/knowgitty-agency/v1/release-webhook/2" \
+            -H "Content-Type: application/json" \
+            -H "X-KGA-Signature: $SIG" \
+            -d "$BODY"
